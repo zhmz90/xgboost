@@ -2,7 +2,12 @@ export CC  = gcc
 export CXX = g++
 export MPICXX = mpicxx
 export LDFLAGS= -pthread -lm 
-export CFLAGS = -Wall -O3 -msse2  -Wno-unknown-pragmas -fPIC
+export CFLAGS = -Wall -O3 -msse2  -Wno-unknown-pragmas -funroll-loops
+
+ifeq ($(OS), Windows_NT)
+	export CXX = g++ -m64
+	export CC = gcc -m64
+endif
 
 ifeq ($(no_omp),1)
 	CFLAGS += -DDISABLE_OPENMP 
@@ -13,7 +18,6 @@ endif
 # by default use c++11
 ifeq ($(cxx11),1)
 	CFLAGS += -std=c++11
-else 
 endif
 
 # handling dmlc
@@ -33,16 +37,36 @@ else
 	LIBDMLC=dmlc_simple.o
 endif
 
+ifndef WITH_FPIC
+	WITH_FPIC = 1
+endif
+ifeq ($(WITH_FPIC), 1)
+	CFLAGS += -fPIC	
+endif
+
+
+ifeq ($(OS), Windows_NT)
+	LIBRABIT = subtree/rabit/lib/librabit_empty.a
+	SLIB = wrapper/xgboost_wrapper.dll
+else
+	LIBRABIT = subtree/rabit/lib/librabit.a
+	SLIB = wrapper/libxgboostwrapper.so
+endif
+
 # specify tensor path
 BIN = xgboost
 MOCKBIN = xgboost.mock
 OBJ = updater.o gbm.o io.o main.o dmlc_simple.o
 MPIBIN =
-SLIB = wrapper/libxgboostwrapper.so 
+ifeq ($(WITH_FPIC), 1)
+	TARGET = $(BIN) $(OBJ) $(SLIB)
+else
+	TARGET = $(BIN)
+endif
 
 .PHONY: clean all mpi python Rpack
 
-all: $(BIN) $(OBJ) $(SLIB)
+all: $(TARGET)
 mpi: $(MPIBIN)
 
 python: wrapper/libxgboostwrapper.so
@@ -52,8 +76,8 @@ dmlc_simple.o: src/io/dmlc_simple.cpp src/utils/*.h
 gbm.o: src/gbm/gbm.cpp src/gbm/*.hpp src/gbm/*.h 
 io.o: src/io/io.cpp src/io/*.hpp src/utils/*.h src/learner/dmatrix.h src/*.h
 main.o: src/xgboost_main.cpp src/utils/*.h src/*.h src/learner/*.hpp src/learner/*.h 
-xgboost:  updater.o gbm.o io.o main.o subtree/rabit/lib/librabit.a $(LIBDMLC)
-wrapper/libxgboostwrapper.so: wrapper/xgboost_wrapper.cpp src/utils/*.h src/*.h src/learner/*.hpp src/learner/*.h  updater.o gbm.o io.o subtree/rabit/lib/librabit.a $(LIBDMLC)
+xgboost:  updater.o gbm.o io.o main.o $(LIBRABIT) $(LIBDMLC)
+wrapper/xgboost_wrapper.dll wrapper/libxgboostwrapper.so: wrapper/xgboost_wrapper.cpp src/utils/*.h src/*.h src/learner/*.hpp src/learner/*.h  updater.o gbm.o io.o $(LIBRABIT) $(LIBDMLC)
 
 # dependency on rabit
 subtree/rabit/lib/librabit.a: subtree/rabit/src/engine.cc
@@ -66,13 +90,13 @@ subtree/rabit/lib/librabit_mpi.a: subtree/rabit/src/engine_mpi.cc
 	+	cd subtree/rabit;make lib/librabit_mpi.a; cd ../..
 
 $(BIN) : 
-	$(CXX) $(CFLAGS) -o $@ $(filter %.cpp %.o %.c %.cc %.a, $^) $(LDFLAGS) 
+	$(CXX) $(CFLAGS) -fPIC -o $@ $(filter %.cpp %.o %.c %.cc %.a, $^) $(LDFLAGS) 
 
 $(MOCKBIN) : 
 	$(CXX) $(CFLAGS) -o $@ $(filter %.cpp %.o %.c %.cc %.a, $^) $(LDFLAGS) 
 
 $(SLIB) :
-	$(CXX) $(CFLAGS) -fPIC -shared -o $@ $(filter %.cpp %.o %.c %.a %.cc, $^) $(LDFLAGS) 
+	$(CXX) $(CFLAGS) -fPIC -shared -o $@ $(filter %.cpp %.o %.c %.a %.cc, $^) $(LDFLAGS) $(DLLFLAGS)
 
 $(OBJ) : 
 	$(CXX) -c $(CFLAGS) -o $@ $(firstword $(filter %.cpp %.c %.cc, $^) )
@@ -99,10 +123,8 @@ Rpack:
 	cp -r src xgboost/src/src
 	mkdir xgboost/src/subtree
 	mkdir xgboost/src/subtree/rabit
-	mkdir xgboost/src/subtree/rabit/rabit-learn
 	cp -r subtree/rabit/include xgboost/src/subtree/rabit/include
 	cp -r subtree/rabit/src xgboost/src/subtree/rabit/src
-	cp -r subtree/rabit/rabit-learn/io xgboost/src/subtree/rabit/rabit-learn/io
 	rm -rf xgboost/src/subtree/rabit/src/*.o
 	mkdir xgboost/src/wrapper
 	cp  wrapper/xgboost_wrapper.h xgboost/src/wrapper

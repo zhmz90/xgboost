@@ -12,6 +12,7 @@
 #include <climits>
 #include <algorithm>
 #include "../sync/sync.h"
+#include "../utils/math.h"
 #include "./evaluation.h"
 #include "./helper_utils.h"
 
@@ -106,6 +107,18 @@ struct EvalError : public EvalEWiseBase<EvalError> {
   }
 };
 
+/*! \brief loglikelihood of poission distribution */
+struct EvalPoissionNegLogLik : public EvalEWiseBase<EvalPoissionNegLogLik> {
+  virtual const char *Name(void) const {
+    return "poisson-nloglik";
+  }
+  inline static float EvalRow(float y, float py) {
+    const float eps = 1e-16f;
+    if (py < eps) py = eps;
+    return utils::LogGamma(y + 1.0f) + py - std::log(py) * y;
+  }
+};
+
 /*! 
  * \brief base class of multi-class evaluation
  * \tparam Derived the name of subclass
@@ -130,7 +143,7 @@ struct EvalMClassBase : public IEvaluator {
       const float wt = info.GetWeight(i);
       int label =  static_cast<int>(info.labels[i]);
       if (label >= 0 && label < static_cast<int>(nclass)) {
-        sum += Derived::EvalRow(info.labels[i],
+        sum += Derived::EvalRow(label,
                                 BeginPtr(preds) + i * nclass,
                                 nclass) * wt;
         wsum += wt;

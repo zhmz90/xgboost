@@ -1,8 +1,8 @@
 # coding: utf-8
-
 """
 xgboost: eXtreme Gradient Boosting library
 
+Version: 0.40
 Authors: Tianqi Chen, Bing Xu
 Early stopping by Zygmunt Zając
 """
@@ -11,7 +11,9 @@ from __future__ import absolute_import
 
 import os
 import sys
+import re
 import ctypes
+import platform
 import collections
 
 import numpy as np
@@ -25,6 +27,11 @@ try:
 except ImportError:
     SKLEARN_INSTALLED = False
 
+class XGBoostLibraryNotFound(Exception):
+    pass
+
+class XGBoostError(Exception):
+    pass
 
 __all__ = ['DMatrix', 'CVPack', 'Booster', 'aggcv', 'cv', 'mknfold', 'train']
 
@@ -35,14 +42,21 @@ else:
 
 
 def load_xglib():
-    dll_path = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
+    curr_path = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
+    dll_path = [curr_path]
     if os.name == 'nt':
-        dll_path = os.path.join(dll_path, '../windows/x64/Release/xgboost_wrapper.dll')
+        if platform.architecture()[0] == '64bit':
+            dll_path.append(os.path.join(curr_path, '../windows/x64/Release/'))
+        else:
+            dll_path.append(os.path.join(curr_path, '../windows/Release/'))
+    if os.name == 'nt':
+        dll_path = [os.path.join(p, 'xgboost_wrapper.dll') for p in dll_path]
     else:
-        dll_path = os.path.join(dll_path, 'libxgboostwrapper.so')
-
-    # load the xgboost wrapper library
-    lib = ctypes.cdll.LoadLibrary(dll_path)
+        dll_path = [os.path.join(p, 'libxgboostwrapper.so') for p in dll_path]
+    lib_path = [p for p in dll_path if os.path.exists(p) and os.path.isfile(p)]
+    if len(dll_path) == 0:
+        raise XGBoostLibraryNotFound('cannot find find the files in the candicate path ' + str(dll_path))
+    lib = ctypes.cdll.LoadLibrary(lib_path[0])
 
     # DMatrix functions
     lib.XGDMatrixCreateFromFile.restype = ctypes.c_void_p
@@ -59,6 +73,8 @@ def load_xglib():
     lib.XGBoosterPredict.restype = ctypes.POINTER(ctypes.c_float)
     lib.XGBoosterEvalOneIter.restype = ctypes.c_char_p
     lib.XGBoosterDumpModel.restype = ctypes.POINTER(ctypes.c_char_p)
+    lib.XGBoosterGetModelRaw.restype = ctypes.POINTER(ctypes.c_char)
+    lib.XGBoosterLoadModelFromBuffer.restype = ctypes.c_void_p
 
     return lib
 
@@ -77,6 +93,14 @@ def ctypes2numpy(cptr, length, dtype):
         raise RuntimeError('memmove failed')
     return res
 
+def ctypes2buffer(cptr, length):
+    if not isinstance(cptr, ctypes.POINTER(ctypes.c_char)):
+        raise RuntimeError('expected char pointer')
+    res = bytearray(length)
+    rptr = (ctypes.c_char * length).from_buffer(res)
+    if not ctypes.memmove(rptr, cptr, length):
+        raise RuntimeError('memmove failed')
+    return res
 
 def c_str(string):
     return ctypes.c_char_p(string.encode('utf-8'))
@@ -94,7 +118,8 @@ class DMatrix(object):
         Parameters
         ----------
         data : string/numpy array/scipy.sparse
-            Data source, string type is the path of svmlight format txt file or xgb buffer.
+            Data source, string type is the path of svmlight format txt file,
+            xgb buffer or path to cache_file
         label : list or numpy 1-D array (optional)
             Label of the training data.
         missing : float
@@ -456,9 +481,25 @@ class Booster(object):
         Parameters
         ----------
         fname : string
-            Output file name.
+            Output file name
         """
-        xglib.XGBoosterSaveModel(self.handle, c_str(fname))
+        if isinstance(fname, string_types):  # assume file name
+            xglib.XGBoosterSaveModel(self.handle, c_str(fname))
+        else:
+            raise TypeError("fname must be a string")
+
+    def save_raw(self):
+        """
+        Save the model to a in memory buffer represetation
+
+        Returns
+        -------
+        a in memory buffer represetation of the model
+        """
+        length = ctypes.c_ulong()
+        cptr = xglib.XGBoosterGetModelRaw(self.handle,
+                                          ctypes.byref(length))
+        return ctypes2buffer(cptr, length.value)
 
     def load_model(self, fname):
         """
@@ -466,10 +507,16 @@ class Booster(object):
 
         Parameters
         ----------
-        fname : string
-            Input file name.
+        fname : string or a memory buffer
+            Input file name or memory buffer(see also save_raw)
         """
-        xglib.XGBoosterLoadModel(self.handle, c_str(fname))
+        if isinstance(fname, str):  # assume file name
+            xglib.XGBoosterLoadModel(self.handle, c_str(fname))
+        else:
+            buf = fname
+            length = ctypes.c_ulong(len(buf))
+            ptr = (ctypes.c_char * len(buf)).from_buffer(buf)
+            xglib.XGBoosterLoadModelFromBuffer(self.handle, ptr, length)
 
     def dump_model(self, fo, fmap='', with_stats=False):
         """
@@ -505,7 +552,7 @@ class Booster(object):
                                         int(with_stats), ctypes.byref(length))
         res = []
         for i in range(length.value):
-            res.append(str(sarr[i]))
+            res.append(str(sarr[i].decode('ascii')))
         return res
 
     def get_fscore(self, fmap=''):
@@ -515,7 +562,6 @@ class Booster(object):
         trees = self.get_dump(fmap)
         fmap = {}
         for tree in trees:
-            sys.stdout.write(str(tree) + '\n')
             for l in tree.split('\n'):
                 arr = l.split('[')
                 if len(arr) == 1:
@@ -529,7 +575,8 @@ class Booster(object):
         return fmap
 
 
-def train(params, dtrain, num_boost_round=10, evals=(), obj=None, feval=None, early_stopping_rounds=None):
+def train(params, dtrain, num_boost_round=10, evals=(), obj=None, feval=None,
+    early_stopping_rounds=None,evals_result=None):
     """
     Train a booster with given parameters.
 
@@ -541,7 +588,7 @@ def train(params, dtrain, num_boost_round=10, evals=(), obj=None, feval=None, ea
         Data to be trained.
     num_boost_round: int
         Number of boosting iterations.
-    watchlist : list of pairs (DMatrix, string)
+    watchlist (evals): list of pairs (DMatrix, string)
         List of items to be evaluated during training, this allows user to watch
         performance on the validation set.
     obj : function
@@ -556,6 +603,8 @@ def train(params, dtrain, num_boost_round=10, evals=(), obj=None, feval=None, ea
         Returns the model from the last iteration (not the best one).
         If early stopping occurs, the model will have two additional fields:
         bst.best_score and bst.best_iteration.
+    evals_result: dict
+        This dictionary stores the evaluation results of all the items in watchlist
 
     Returns
     -------
@@ -565,22 +614,36 @@ def train(params, dtrain, num_boost_round=10, evals=(), obj=None, feval=None, ea
     evals = list(evals)
     bst = Booster(params, [dtrain] + [d[0] for d in evals])
 
+    if evals_result is not None:
+        if type(evals_result) is not dict:
+            raise TypeError('evals_result has to be a dictionary')
+        else:
+            evals_name = [d[1] for d in evals]
+            evals_result.clear()
+            evals_result.update({key:[] for key in evals_name})
+
     if not early_stopping_rounds:
         for i in range(num_boost_round):
             bst.update(dtrain, i, obj)
             if len(evals) != 0:
                 bst_eval_set = bst.eval_set(evals, i, feval)
                 if isinstance(bst_eval_set, string_types):
-                    sys.stderr.write(bst_eval_set + '\n')
+                    msg = bst_eval_set
                 else:
-                    sys.stderr.write(bst_eval_set.decode() + '\n')
+                    msg = bst_eval_set.decode()
+
+                sys.stderr.write(msg + '\n')
+                if evals_result is not None:
+                    res = re.findall(":([0-9.]+).",msg)
+                    for key,val in zip(evals_name,res):
+                        evals_result[key].append(val)
         return bst
 
     else:
         # early stopping
 
         if len(evals) < 1:
-            raise ValueError('For early stopping you need at least on set in evals.')
+            raise ValueError('For early stopping you need at least one set in evals.')
 
         sys.stderr.write("Will train until {} error hasn't decreased in {} rounds.\n".format(evals[-1][1], early_stopping_rounds))
 
@@ -594,7 +657,7 @@ def train(params, dtrain, num_boost_round=10, evals=(), obj=None, feval=None, ea
         maximize_score = False
         if 'eval_metric' in params:
             maximize_metrics = ('auc', 'map', 'ndcg')
-            if filter(lambda x: params['eval_metric'].startswith(x), maximize_metrics):
+            if list(filter(lambda x: params['eval_metric'].startswith(x), maximize_metrics)):
                 maximize_score = True
 
         if maximize_score:
@@ -616,6 +679,11 @@ def train(params, dtrain, num_boost_round=10, evals=(), obj=None, feval=None, ea
 
             sys.stderr.write(msg + '\n')
 
+            if evals_result is not None:
+                res = re.findall(":([0-9.]+).",msg)
+                for key,val in zip(evals_name,res):
+                    evals_result[key].append(val)
+
             score = float(msg.rsplit(':', 1)[1])
             if (maximize_score and score > best_score) or \
                     (not maximize_score and score < best_score):
@@ -626,10 +694,10 @@ def train(params, dtrain, num_boost_round=10, evals=(), obj=None, feval=None, ea
                 sys.stderr.write("Stopping. Best iteration:\n{}\n\n".format(best_msg))
                 bst.best_score = best_score
                 bst.best_iteration = best_score_i
-                return bst
-
+                break
+        bst.best_score = best_score
+        bst.best_iteration = best_score_i
         return bst
-
 
 class CVPack(object):
     def __init__(self, dtrain, dtest, param):
@@ -739,12 +807,16 @@ def cv(params, dtrain, num_boost_round=10, nfold=3, metrics=(),
     return results
 
 
+# used for compatiblity without sklearn
 XGBModelBase = object
+XGBClassifier = object
+XGBRegressor = object
 if SKLEARN_INSTALLED:
     XGBModelBase = BaseEstimator
+    XGBRegressor = RegressorMixin
+    XGBClassifier = ClassifierMixin
 
-
-class XGBModel(BaseEstimator):
+class XGBModel(XGBModelBase):
     """
     Implementation of the Scikit-Learn API for XGBoost.
 
@@ -758,31 +830,86 @@ class XGBModel(BaseEstimator):
         Number of boosted trees to fit.
     silent : boolean
         Whether to print messages while running boosting.
+    objective : string
+        Specify the learning task and the corresponding learning objective.
+
+    nthread : int
+        Number of parallel threads used to run xgboost.
+    gamma : float
+        Minimum loss reduction required to make a further partition on a leaf node of the tree.
+    min_child_weight : int
+        Minimum sum of instance weight(hessian) needed in a child.
+    max_delta_step : int
+        Maximum delta step we allow each tree's weight estimation to be.
+    subsample : float
+        Subsample ratio of the training instance.
+    colsample_bytree : float
+        Subsample ratio of columns when constructing each tree.
+
+    base_score:
+        The initial prediction score of all instances, global bias.
+    seed : int
+        Random number seed.
     """
-    def __init__(self, max_depth=3, learning_rate=0.1, n_estimators=100, silent=True, objective="reg:linear"):
+    def __init__(self, max_depth=3, learning_rate=0.1, n_estimators=100, silent=True, objective="reg:linear",
+                 nthread=-1, gamma=0, min_child_weight=1, max_delta_step=0, subsample=1, colsample_bytree=1,
+                 base_score=0.5, seed=0):
         if not SKLEARN_INSTALLED:
-            raise Exception('sklearn needs to be installed in order to use this module')
+            raise XGBError('sklearn needs to be installed in order to use this module')
         self.max_depth = max_depth
         self.learning_rate = learning_rate
-        self.silent = silent
         self.n_estimators = n_estimators
+        self.silent = silent
         self.objective = objective
-        self._Booster = Booster()
 
-    def get_params(self, deep=True):
-        return {'max_depth': self.max_depth,
-                'learning_rate': self.learning_rate,
-                'n_estimators': self.n_estimators,
-                'silent': self.silent,
-                'objective': self.objective
-                }
+        self.nthread = nthread
+        self.gamma = gamma
+        self.min_child_weight = min_child_weight
+        self.max_delta_step = max_delta_step
+        self.subsample = subsample
+        self.colsample_bytree = colsample_bytree
+
+        self.base_score = base_score
+        self.seed = seed
+
+        self._Booster = None
+
+    def __getstate__(self):
+        # can't pickle ctypes pointers so put _Booster in a bytearray object
+        this = self.__dict__.copy()  # don't modify in place
+        bst = this["_Booster"]
+        if bst is not None:
+            raw = this["_Booster"].save_raw()
+            this["_Booster"] = raw
+        return this
+
+    def __setstate__(self, state):
+        bst = state["_Booster"]
+        if bst is not None:
+            state["_Booster"] = Booster(model_file=bst)
+        self.__dict__.update(state)
+
+    def booster(self):
+        """
+        get the underlying xgboost Booster of this model
+        will raise an exception when fit was not called
+
+        Returns
+        -------
+        booster : a xgboost booster of underlying model
+        """
+        if self._Booster is None:
+            raise XGBError('need to call fit beforehand')
+        return self._Booster
 
     def get_xgb_params(self):
-        return {'eta': self.learning_rate,
-                'max_depth': self.max_depth,
-                'silent': 1 if self.silent else 0,
-                'objective': self.objective
-                }
+        xgb_params = self.get_params()
+
+        xgb_params['silent'] = 1 if self.silent else 0
+
+        if self.nthread <= 0:
+            xgb_params.pop('nthread', None)
+        return xgb_params
 
     def fit(self, X, y):
         trainDmatrix = DMatrix(X, label=y)
@@ -791,20 +918,30 @@ class XGBModel(BaseEstimator):
 
     def predict(self, X):
         testDmatrix = DMatrix(X)
-        return self._Booster.predict(testDmatrix)
+        return self.booster().predict(testDmatrix)
 
 
-class XGBClassifier(XGBModel, ClassifierMixin):
-    def __init__(self, max_depth=3, learning_rate=0.1, n_estimators=100, silent=True, objective="binary:logistic"):
-        super(XGBClassifier, self).__init__(max_depth, learning_rate, n_estimators, silent, objective)
+class XGBClassifier(XGBModel, XGBClassifier):
+    __doc__ = """
+    Implementation of the scikit-learn API for XGBoost classification
+    """ + "\n".join(XGBModel.__doc__.split('\n')[2:])
+
+    def __init__(self, max_depth=3, learning_rate=0.1, n_estimators=100, silent=True, objective="binary:logistic",
+                 nthread=-1, gamma=0, min_child_weight=1, max_delta_step=0, subsample=1, colsample_bytree=1,
+                 base_score=0.5, seed=0):
+        super(XGBClassifier, self).__init__(max_depth, learning_rate, n_estimators, silent, objective,
+                                            nthread, gamma, min_child_weight, max_delta_step, subsample,
+                                            colsample_bytree,
+                                            base_score, seed)
 
     def fit(self, X, y, sample_weight=None):
-        y_values = list(np.unique(y))
-        if len(y_values) > 2:
+        self.classes_ = list(np.unique(y))
+        self.n_classes_ = len(self.classes_)
+        if self.n_classes_ > 2:
             # Switch to using a multiclass objective in the underlying XGB instance
             self.objective = "multi:softprob"
             xgb_options = self.get_xgb_params()
-            xgb_options['num_class'] = len(y_values)
+            xgb_options['num_class'] = self.n_classes_
         else:
             xgb_options = self.get_xgb_params()
 
@@ -822,7 +959,7 @@ class XGBClassifier(XGBModel, ClassifierMixin):
 
     def predict(self, X):
         testDmatrix = DMatrix(X)
-        class_probs = self._Booster.predict(testDmatrix)
+        class_probs = self.booster().predict(testDmatrix)
         if len(class_probs.shape) > 1:
             column_indexes = np.argmax(class_probs, axis=1)
         else:
@@ -832,7 +969,7 @@ class XGBClassifier(XGBModel, ClassifierMixin):
 
     def predict_proba(self, X):
         testDmatrix = DMatrix(X)
-        class_probs = self._Booster.predict(testDmatrix)
+        class_probs = self.booster().predict(testDmatrix)
         if self.objective == "multi:softprob":
             return class_probs
         else:
@@ -841,5 +978,9 @@ class XGBClassifier(XGBModel, ClassifierMixin):
             return np.vstack((classzero_probs, classone_probs)).transpose()
 
 
-class XGBRegressor(XGBModel, RegressorMixin):
+class XGBRegressor(XGBModel, XGBRegressor):
+    __doc__ = """
+    Implementation of the scikit-learn API for XGBoost regression
+    """ + "\n".join(XGBModel.__doc__.split('\n')[2:])
+
     pass

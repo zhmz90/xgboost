@@ -23,7 +23,7 @@ namespace learner {
  * \brief learner that takes do gradient boosting on specific objective functions
  *  and do training and prediction
  */
-class BoostLearner : public rabit::ISerializable {
+class BoostLearner : public rabit::Serializable {
  public:
   BoostLearner(void) {
     obj_ = NULL;
@@ -69,7 +69,7 @@ class BoostLearner : public rabit::ISerializable {
     utils::SPrintf(str_temp, sizeof(str_temp), "%lu", 
                    static_cast<unsigned long>(buffer_size));
     this->SetParam("num_pbuffer", str_temp);
-    this->pred_buffer_size = buffer_size;
+    this->pred_buffer_size = buffer_size;    
   }
   /*!
    * \brief set parameters from outside
@@ -107,7 +107,9 @@ class BoostLearner : public rabit::ISerializable {
     }
     if (!strcmp("seed_per_iter", name)) seed_per_iteration = atoi(val);
     if (!strcmp("save_base64", name)) save_base64 = atoi(val);
-    if (!strcmp(name, "num_class")) this->SetParam("num_output_group", val);
+    if (!strcmp(name, "num_class")) {
+      this->SetParam("num_output_group", val);
+    }
     if (!strcmp(name, "nthread")) {
       omp_set_num_threads(atoi(val));
     }
@@ -155,23 +157,21 @@ class BoostLearner : public rabit::ISerializable {
   /*!
    * \brief load model from stream
    * \param fi input stream
-   * \param with_pbuffer whether to load with predict buffer
    * \param calc_num_feature whether call InitTrainer with calc_num_feature
    */
   inline void LoadModel(utils::IStream &fi,
-                        bool with_pbuffer = true,
                         bool calc_num_feature = true) {
     utils::Check(fi.Read(&mparam, sizeof(ModelParam)) != 0,
                  "BoostLearner: wrong model format");
     {
       // backward compatibility code for compatible with old model type
       // for new model, Read(&name_obj_) is suffice      
-      size_t len;
+      uint64_t len;
       utils::Check(fi.Read(&len, sizeof(len)) != 0, "BoostLearner: wrong model format");
       if (len >= std::numeric_limits<unsigned>::max()) {
         int gap;
         utils::Check(fi.Read(&gap, sizeof(gap)) != 0, "BoostLearner: wrong model format");
-        len = len >> 32UL;
+        len = len >> static_cast<uint64_t>(32UL);
       }
       if (len != 0) {
         name_obj_.resize(len);
@@ -187,20 +187,20 @@ class BoostLearner : public rabit::ISerializable {
     char tmp[32];
     utils::SPrintf(tmp, sizeof(tmp), "%u", mparam.num_class);
     obj_->SetParam("num_class", tmp);
-    gbm_->LoadModel(fi, with_pbuffer);
-    if (!with_pbuffer || distributed_mode == 2) {
+    gbm_->LoadModel(fi, mparam.saved_with_pbuffer != 0);
+    if (mparam.saved_with_pbuffer == 0) {
       gbm_->ResetPredBuffer(pred_buffer_size);
     }
   }
   // rabit load model from rabit checkpoint
-  virtual void Load(rabit::IStream &fi) {
+  virtual void Load(rabit::Stream *fi) {
     // for row split, we should not keep pbuffer
-    this->LoadModel(fi, distributed_mode != 2, false);
+    this->LoadModel(*fi, false);
   }
   // rabit save model to rabit checkpoint
-  virtual void Save(rabit::IStream &fo) const {
+  virtual void Save(rabit::Stream *fo) const {
     // for row split, we should not keep pbuffer
-    this->SaveModel(fo, distributed_mode != 2);
+    this->SaveModel(*fo, distributed_mode != 2);
   }
   /*!
    * \brief load model from file
@@ -216,18 +216,20 @@ class BoostLearner : public rabit::ISerializable {
     if (header == "bs64") {
       utils::Base64InStream bsin(fi);
       bsin.InitPosition();
-      this->LoadModel(bsin);
+      this->LoadModel(bsin, true);
     } else if (header == "binf") {
-      this->LoadModel(*fi);
+      this->LoadModel(*fi, true);
     } else {
       delete fi;
       fi = utils::IStream::Create(fname, "r");
-      this->LoadModel(*fi);
+      this->LoadModel(*fi, true);
     }
     delete fi;   
   }
-  inline void SaveModel(utils::IStream &fo, bool with_pbuffer = true) const {
-    fo.Write(&mparam, sizeof(ModelParam));
+  inline void SaveModel(utils::IStream &fo, bool with_pbuffer) const {
+    ModelParam p = mparam;
+    p.saved_with_pbuffer = static_cast<int>(with_pbuffer);
+    fo.Write(&p, sizeof(ModelParam));
     fo.Write(name_obj_);
     fo.Write(name_gbm_);
     gbm_->SaveModel(fo, with_pbuffer);
@@ -235,18 +237,18 @@ class BoostLearner : public rabit::ISerializable {
   /*!
    * \brief save model into file
    * \param fname file name
-   * \param save_base64 whether save in base64 format
+   * \param with_pbuffer whether save pbuffer together
    */
-  inline void SaveModel(const char *fname, bool save_base64 = false) const {
+  inline void SaveModel(const char *fname, bool with_pbuffer) const {
     utils::IStream *fo = utils::IStream::Create(fname, "w");
     if (save_base64 != 0 || !strcmp(fname, "stdout")) {
       fo->Write("bs64\t", 5);
       utils::Base64OutStream bout(fo);
-      this->SaveModel(bout);
+      this->SaveModel(bout, with_pbuffer);
       bout.Finish('\n');    
     } else {
       fo->Write("binf", 4);
-      this->SaveModel(*fo);
+      this->SaveModel(*fo, with_pbuffer);
     }
     delete fo;
   }
@@ -259,7 +261,12 @@ class BoostLearner : public rabit::ISerializable {
     int ncol = static_cast<int>(p_train->info.info.num_col);    
     std::vector<bool> enabled(ncol, true);    
     // initialize column access
-    p_train->fmat()->InitColAccess(enabled, prob_buffer_row);    
+    p_train->fmat()->InitColAccess(enabled, prob_buffer_row);
+    const int kMagicPage = 0xffffab02;
+    // check, if it is DMatrixPage, then use hist maker
+    if (p_train->magic == kMagicPage) {
+      this->SetParam("updater", "grow_histmaker,prune");
+    }
   }
   /*!
    * \brief update the model for one iteration
@@ -379,13 +386,23 @@ class BoostLearner : public rabit::ISerializable {
     utils::Assert(gbm_ == NULL, "GBM and obj should be NULL");
     obj_ = CreateObjFunction(name_obj_.c_str());
     gbm_ = gbm::CreateGradBooster(name_gbm_.c_str());
-    
+    this->InitAdditionDefaultParam();
+    // set parameters
     for (size_t i = 0; i < cfg_.size(); ++i) {
       obj_->SetParam(cfg_[i].first.c_str(), cfg_[i].second.c_str());
       gbm_->SetParam(cfg_[i].first.c_str(), cfg_[i].second.c_str());
-    }
+    }   
     if (evaluator_.Size() == 0) {
       evaluator_.AddEval(obj_->DefaultEvalMetric());
+    }
+  }
+  /*! 
+   * \brief additional default value for specific objs
+   */
+  inline void InitAdditionDefaultParam(void) {
+    if (name_obj_ == "count:poisson") {
+      obj_->SetParam("max_delta_step", "0.7");
+      gbm_->SetParam("max_delta_step", "0.7");
     }
   }
   /*! 
@@ -426,14 +443,17 @@ class BoostLearner : public rabit::ISerializable {
     unsigned num_feature;
     /* \brief number of class, if it is multi-class classification  */
     int num_class;
+    /*! \brief whether the model itself is saved with pbuffer */
+    int saved_with_pbuffer;
     /*! \brief reserved field */
-    int reserved[31];
+    int reserved[30];
     /*! \brief constructor */
     ModelParam(void) {
+      std::memset(this, 0, sizeof(ModelParam));
       base_score = 0.5f;
       num_feature = 0;
       num_class = 0;
-      std::memset(reserved, 0, sizeof(reserved));
+      saved_with_pbuffer = 0;
     }
     /*!
      * \brief set parameters from outside

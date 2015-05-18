@@ -9,17 +9,13 @@
 #include <algorithm>
 // include all std functions
 using namespace std;
-
-#ifdef _MSC_VER
-#define isnan(x) (_isnan(x) != 0)
-#endif
-
 #include "./xgboost_wrapper.h"
 #include "../src/data.h"
 #include "../src/learner/learner-inl.hpp"
 #include "../src/io/io.h"
 #include "../src/utils/utils.h"
-#include "../src/utils/matrix_csr.h"
+#include "../src/utils/math.h"
+#include "../src/utils/group_data.h"
 #include "../src/io/simple_dmatrix-inl.hpp"
 
 using namespace xgboost;
@@ -62,13 +58,14 @@ class Booster: public learner::BoostLearner {
   }
   inline void LoadModelFromBuffer(const void *buf, size_t size) {
     utils::MemoryFixSizeBuffer fs((void*)buf, size);
-    learner::BoostLearner::LoadModel(fs);
+    learner::BoostLearner::LoadModel(fs, true);
     this->init_model = true;    
   }
   inline const char *GetModelRaw(bst_ulong *out_len) {
+    this->CheckInitModel();
     model_str.resize(0);
     utils::MemoryBufferStream fs(&model_str);
-    learner::BoostLearner::SaveModel(fs);
+    learner::BoostLearner::SaveModel(fs, false);
     *out_len = static_cast<bst_ulong>(model_str.length());
     if (*out_len == 0) {
       return NULL;
@@ -97,14 +94,6 @@ class Booster: public learner::BoostLearner {
  private:
   bool init_model;
 };
-#if !defined(XGBOOST_STRICT_CXX98_)
-inline bool CheckNAN(float v) {
-  return isnan(v);
-}
-#else
-// redirect to defs in R
-bool CheckNAN(float v);
-#endif
 }  // namespace wrapper
 }  // namespace xgboost
 
@@ -139,20 +128,32 @@ extern "C"{
                                        const float *data,
                                        bst_ulong nindptr,
                                        bst_ulong nelem) {
+    int nthread;
+    #pragma omp parallel
+    {
+      nthread = omp_get_num_threads();
+    }
+    
     DMatrixSimple *p_mat = new DMatrixSimple();
     DMatrixSimple &mat = *p_mat;
-    utils::SparseCSRMBuilder<RowBatch::Entry, false> builder(mat.row_ptr_, mat.row_data_);
-    builder.InitBudget();
-    bst_ulong ncol = nindptr - 1;
-    for (bst_ulong i = 0; i < ncol; ++i) {
+    utils::ParallelGroupBuilder<RowBatch::Entry> builder(&mat.row_ptr_, &mat.row_data_);
+    builder.InitBudget(0, nthread);
+    long ncol = static_cast<long>(nindptr - 1);
+    #pragma omp parallel for schedule(static)
+    for (long i = 0; i < ncol; ++i) {
+      int tid = omp_get_thread_num();
       for (unsigned j = col_ptr[i]; j < col_ptr[i+1]; ++j) {
-        builder.AddBudget(indices[j]);
+        builder.AddBudget(indices[j], tid);
       }
     }
     builder.InitStorage();
-    for (bst_ulong i = 0; i < ncol; ++i) {
+    #pragma omp parallel for schedule(static)
+    for (long i = 0; i < ncol; ++i) {
+      int tid = omp_get_thread_num();
       for (unsigned j = col_ptr[i]; j < col_ptr[i+1]; ++j) {
-        builder.PushElem(indices[j], RowBatch::Entry(static_cast<bst_uint>(i), data[j]));
+        builder.Push(indices[j],
+                     RowBatch::Entry(static_cast<bst_uint>(i), data[j]),
+                     tid);
       }
     }
     mat.info.info.num_row = mat.row_ptr_.size() - 1;
@@ -163,7 +164,7 @@ extern "C"{
                                bst_ulong nrow,
                                bst_ulong ncol,
                                float  missing) {    
-    bool nan_missing = CheckNAN(missing);
+    bool nan_missing = utils::CheckNAN(missing);
     DMatrixSimple *p_mat = new DMatrixSimple();
     DMatrixSimple &mat = *p_mat;
     mat.info.info.num_row = nrow;
@@ -171,7 +172,7 @@ extern "C"{
     for (bst_ulong i = 0; i < nrow; ++i, data += ncol) {
       bst_ulong nelem = 0;
       for (bst_ulong j = 0; j < ncol; ++j) {
-        if (CheckNAN(data[j])) {
+        if (utils::CheckNAN(data[j])) {
           utils::Check(nan_missing,
                        "There are NAN in the matrix, however, you did not set missing=NAN"); 
         } else {
@@ -254,7 +255,7 @@ extern "C"{
     pmat->info.group_ptr.resize(len + 1);
     pmat->info.group_ptr[0] = 0;
     for (uint64_t i = 0; i < len; ++i) {
-      pmat->info.group_ptr[i+1] = pmat->info.group_ptr[i]+group[i];
+      pmat->info.group_ptr[i+1] = pmat->info.group_ptr[i] + group[i];
     }
   }
   const float* XGDMatrixGetFloatInfo(const void *handle, const char *field, bst_ulong* len) {
@@ -322,8 +323,10 @@ extern "C"{
   void XGBoosterLoadModel(void *handle, const char *fname) {
     static_cast<Booster*>(handle)->LoadModel(fname);
   }
-  void XGBoosterSaveModel(const void *handle, const char *fname) {
-    static_cast<const Booster*>(handle)->SaveModel(fname);
+  void XGBoosterSaveModel(void *handle, const char *fname) {
+    Booster *bst = static_cast<Booster*>(handle);
+    bst->CheckInitModel();
+    bst->SaveModel(fname, false);
   }
   void XGBoosterLoadModelFromBuffer(void *handle, const void *buf, bst_ulong len) {
     static_cast<Booster*>(handle)->LoadModelFromBuffer(buf, len);

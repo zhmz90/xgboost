@@ -64,7 +64,13 @@ class GBTree : public IGradBooster {
   }
   virtual void SaveModel(utils::IStream &fo, bool with_pbuffer) const {
     utils::Assert(mparam.num_trees == static_cast<int>(trees.size()), "GBTree");
-    fo.Write(&mparam, sizeof(ModelParam));
+    if (with_pbuffer) {
+      fo.Write(&mparam, sizeof(ModelParam));      
+    } else {
+      ModelParam p = mparam;
+      p.num_pbuffer = 0;
+      fo.Write(&p, sizeof(ModelParam));
+    }
     for (size_t i = 0; i < trees.size(); ++i) {
       trees[i]->SaveModel(fo);
     }
@@ -372,7 +378,7 @@ class GBTree : public IGradBooster {
       #pragma omp parallel for schedule(static)
       for (bst_omp_uint i = 0; i < nsize; ++i) {
         const int tid = omp_get_thread_num();
-        int64_t ridx = static_cast<int64_t>(batch.base_rowid + i);
+        size_t ridx = static_cast<size_t>(batch.base_rowid + i);
         tree::RegTree::FVec &feats = thread_temp[tid];
         feats.Fill(batch[i]);
         for (unsigned j = 0; j < ntree_limit; ++j) {

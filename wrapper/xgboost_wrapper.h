@@ -6,7 +6,7 @@
  * \brief a C style wrapper of xgboost
  *  can be used to create wrapper of other languages
  */
-#ifdef _MSC_VER
+#if defined(_MSC_VER) || defined(_WIN32)
 #define XGB_DLL __declspec(dllexport)
 #else
 #define XGB_DLL
@@ -19,6 +19,8 @@ extern "C" {
 #endif
   /*!
    * \brief load a data matrix 
+   * \param fname the name of the file
+   * \param silent whether print messages during loading
    * \return a loaded data matrix
    */
   XGB_DLL void* XGDMatrixCreateFromFile(const char *fname, int silent);
@@ -201,7 +203,7 @@ extern "C" {
    * \param handle handle
    * \param fname file name
    */
-  XGB_DLL void XGBoosterSaveModel(const void *handle, const char *fname);
+  XGB_DLL void XGBoosterSaveModel(void *handle, const char *fname);
   /*!
    * \brief load model from in memory buffer
    * \param handle handle

@@ -46,15 +46,33 @@
 #'   \item \code{merror} Exact matching error, used to evaluate multi-class classification
 #' }
 #' @param obj customized objective function. Returns gradient and second order 
-#'   gradient with given prediction and dtrain, 
+#'   gradient with given prediction and dtrain.
 #' @param feval custimized evaluation function. Returns 
 #'   \code{list(metric='metric-name', value='metric-value')} with given 
-#'   prediction and dtrain,
-#' @param verbose \code{boolean}, print the statistics during the process.
+#'   prediction and dtrain.
+#' @param stratified \code{boolean} whether sampling of folds should be stratified by the values of labels in \code{data}
+#' @param folds \code{list} provides a possibility of using a list of pre-defined CV folds (each element must be a vector of fold's indices).
+#'   If folds are supplied, the nfold and stratified parameters would be ignored.
+#' @param verbose \code{boolean}, print the statistics during the process
+#' @param printEveryN Print every N progress messages when \code{verbose>0}. Default is 1 which means all messages are printed.
+#' @param early_stop_round If \code{NULL}, the early stopping function is not triggered. 
+#'     If set to an integer \code{k}, training with a validation set will stop if the performance 
+#'     keeps getting worse consecutively for \code{k} rounds.
+#' @param early.stop.round An alternative of \code{early_stop_round}.
+#' @param maximize If \code{feval} and \code{early_stop_round} are set, then \code{maximize} must be set as well.
+#'     \code{maximize=TRUE} means the larger the evaluation score the better.
+#'     
 #' @param ... other parameters to pass to \code{params}.
 #' 
-#' @return A \code{data.table} with each mean and standard deviation stat for training set and test set.
-#' 
+#' @return
+#' If \code{prediction = TRUE}, a list with the following elements is returned:
+#' \itemize{
+#'   \item \code{dt} a \code{data.table} with each mean and standard deviation stat for training set and test set
+#'   \item \code{pred} an array or matrix (for multiclass classification) with predictions for each CV-fold for the model having been trained on the data in all other folds.
+#' }
+#'
+#' If \code{prediction = FALSE}, just a \code{data.table} with each mean and standard deviation stat for training set and test set is returned.
+#'
 #' @details 
 #' The original sample is randomly partitioned into \code{nfold} equal size subsamples. 
 #' 
@@ -76,9 +94,16 @@
 #'
 xgb.cv <- function(params=list(), data, nrounds, nfold, label = NULL, missing = NULL, 
                    prediction = FALSE, showsd = TRUE, metrics=list(), 
-                   obj = NULL, feval = NULL, verbose = T,...) {
+                   obj = NULL, feval = NULL, stratified = TRUE, folds = NULL, verbose = T, printEveryN=1L,
+                   early_stop_round = NULL, early.stop.round = NULL, maximize = NULL, ...) {
   if (typeof(params) != "list") {
     stop("xgb.cv: first argument params must be list")
+  }
+  if(!is.null(folds)) {
+    if(class(folds)!="list" | length(folds) < 2) {
+      stop("folds must be a list with 2 or more elements that are vectors of indices for each CV-fold")
+    }
+    nfold <- length(folds)
   }
   if (nfold <= 1) {
     stop("nfold must be bigger than 1")
@@ -93,8 +118,37 @@ xgb.cv <- function(params=list(), data, nrounds, nfold, label = NULL, missing = 
   for (mc in metrics) {
     params <- append(params, list("eval_metric"=mc))
   }
-
-  folds <- xgb.cv.mknfold(dtrain, nfold, params)
+  
+  # Early Stopping
+  if (is.null(early_stop_round) && !is.null(early.stop.round))
+    early_stop_round = early.stop.round
+  if (!is.null(early_stop_round)){
+    if (!is.null(feval) && is.null(maximize))
+      stop('Please set maximize to note whether the model is maximizing the evaluation or not.')
+    if (is.null(maximize) && is.null(params$eval_metric))
+      stop('Please set maximize to note whether the model is maximizing the evaluation or not.')
+    if (is.null(maximize))
+    {
+      if (params$eval_metric %in% c('rmse','logloss','error','merror','mlogloss')) {
+        maximize = FALSE
+      } else {
+        maximize = TRUE
+      }
+    }
+    
+    if (maximize) {
+      bestScore = 0
+    } else {
+      bestScore = Inf
+    }
+    bestInd = 0
+    earlyStopflag = FALSE
+    
+    if (length(metrics)>1)
+      warning('Only the first metric is used for early stopping process.')
+  }
+  
+  xgb_folds <- xgb.cv.mknfold(dtrain, nfold, params, stratified, folds)
   obj_type = params[['objective']]
   mat_pred = FALSE
   if (!is.null(obj_type) && obj_type=='multi:softprob')
@@ -108,10 +162,11 @@ xgb.cv <- function(params=list(), data, nrounds, nfold, label = NULL, missing = 
   else
     predictValues <- rep(0,xgb.numrow(dtrain))
   history <- c()
+  printEveryN = max(as.integer(printEveryN), 1L)
   for (i in 1:nrounds) {
     msg <- list()
     for (k in 1:nfold) {
-      fd <- folds[[k]]
+      fd <- xgb_folds[[k]]
       succ <- xgb.iter.update(fd$booster, fd$dtrain, i - 1, obj)
       if (i<nrounds) {
           msg[[k]] <- xgb.iter.eval(fd$booster, fd$watchlist, i - 1, feval) %>% str_split("\t") %>% .[[1]]
@@ -132,7 +187,27 @@ xgb.cv <- function(params=list(), data, nrounds, nfold, label = NULL, missing = 
     }
     ret <- xgb.cv.aggcv(msg, showsd)
     history <- c(history, ret)
-    if(verbose) paste(ret, "\n", sep="") %>% cat
+    if(verbose)
+      if (0==(i-1L)%%printEveryN)
+        cat(ret, "\n", sep="")
+    
+    # early_Stopping
+    if (!is.null(early_stop_round)){
+      score = strsplit(ret,'\\s+')[[1]][1+length(metrics)+1]
+      score = strsplit(score,'\\+|:')[[1]][[2]]
+      score = as.numeric(score)
+      if ((maximize && score>bestScore) || (!maximize && score<bestScore)) {
+        bestScore = score
+        bestInd = i
+      } else {
+        if (i-bestInd>=early_stop_round) {
+          earlyStopflag = TRUE
+          cat('Stopping. Best iteration:',bestInd)
+          break
+        }
+      }
+    }
+    
   }
   
   colnames <- str_split(string = history[1], pattern = "\t")[[1]] %>% .[2:length(.)] %>% str_extract(".*:") %>% str_replace(":","") %>% str_replace("-", ".")
@@ -147,7 +222,7 @@ xgb.cv <- function(params=list(), data, nrounds, nfold, label = NULL, missing = 
   dt <- read.table(text = "", colClasses = type, col.names = colnames) %>% as.data.table
   split <- str_split(string = history, pattern = "\t")
   
-  for(line in split) dt <- line[2:length(line)] %>% str_extract_all(pattern = "\\d*\\.+\\d*") %>% unlist %>% as.list %>% {vec <- .; rbindlist(list(dt, vec), use.names = F, fill = F)}
+  for(line in split) dt <- line[2:length(line)] %>% str_extract_all(pattern = "\\d*\\.+\\d*") %>% unlist %>% as.numeric %>% as.list %>% {rbindlist(list(dt, .), use.names = F, fill = F)}
   
   if (prediction) {
     return(list(dt = dt,pred = predictValues))
