@@ -36,7 +36,7 @@
 #' 3. Task Parameters 
 #' 
 #' \itemize{
-#' \item \code{objective} specify the learning task and the corresponding learning objective, and the objective options are below:
+#' \item \code{objective} specify the learning task and the corresponding learning objective, users can pass a self-defined function to it. The default objective options are below:
 #'   \itemize{
 #'     \item \code{reg:linear} linear regression (Default).
 #'     \item \code{reg:logistic} logistic regression.
@@ -48,7 +48,7 @@
 #'     \item \code{rank:pairwise} set xgboost to do ranking task by minimizing the pairwise loss.
 #'   }
 #'   \item \code{base_score} the initial prediction score of all instances, global bias. Default: 0.5
-#'   \item \code{eval_metric} evaluation metrics for validation data. Default: metric will be assigned according to objective(rmse for regression, and error for classification, mean average precision for ranking). List is provided in detail section.
+#'   \item \code{eval_metric} evaluation metrics for validation data. Users can pass a self-defined function to it. Default: metric will be assigned according to objective(rmse for regression, and error for classification, mean average precision for ranking). List is provided in detail section.
 #' }
 #' 
 #' @param data takes an \code{xgb.DMatrix} as the input.
@@ -66,13 +66,14 @@
 #'   prediction and dtrain,
 #' @param verbose If 0, xgboost will stay silent. If 1, xgboost will print 
 #'   information of performance. If 2, xgboost will print information of both
-#' @param printEveryN Print every N progress messages when \code{verbose>0}. Default is 1 which means all messages are printed.
-#' @param early_stop_round If \code{NULL}, the early stopping function is not triggered. 
+#' @param print.every.n Print every N progress messages when \code{verbose>0}. Default is 1 which means all messages are printed.
+#' @param early.stop.round If \code{NULL}, the early stopping function is not triggered. 
 #'     If set to an integer \code{k}, training with a validation set will stop if the performance 
 #'     keeps getting worse consecutively for \code{k} rounds.
-#' @param early.stop.round An alternative of \code{early_stop_round}.
-#' @param maximize If \code{feval} and \code{early_stop_round} are set, then \code{maximize} must be set as well.
+#' @param maximize If \code{feval} and \code{early.stop.round} are set, then \code{maximize} must be set as well.
 #'     \code{maximize=TRUE} means the larger the evaluation score the better.
+#' @param save_period save the model to the disk in every \code{save_period} rounds, 0 means no such action.
+#' @param save_name the name or path for periodically saved model file.
 #' @param ... other parameters to pass to \code{params}.
 #' 
 #' @details 
@@ -103,7 +104,6 @@
 #' dtrain <- xgb.DMatrix(agaricus.train$data, label = agaricus.train$label)
 #' dtest <- dtrain
 #' watchlist <- list(eval = dtest, train = dtrain)
-#' param <- list(max.depth = 2, eta = 1, silent = 1)
 #' logregobj <- function(preds, dtrain) {
 #'    labels <- getinfo(dtrain, "label")
 #'    preds <- 1/(1 + exp(-preds))
@@ -116,13 +116,14 @@
 #'   err <- as.numeric(sum(labels != (preds > 0)))/length(labels)
 #'   return(list(metric = "error", value = err))
 #' }
-#' bst <- xgb.train(param, dtrain, nthread = 2, nround = 2, watchlist, logregobj, evalerror)
+#' param <- list(max.depth = 2, eta = 1, silent = 1, objective=logregobj,eval_metric=evalerror)
+#' bst <- xgb.train(param, dtrain, nthread = 2, nround = 2, watchlist)
 #' @export
 #' 
 xgb.train <- function(params=list(), data, nrounds, watchlist = list(), 
-                      obj = NULL, feval = NULL, verbose = 1, printEveryN=1L,
-                      early_stop_round = NULL, early.stop.round = NULL,
-                      maximize = NULL, ...) {
+                      obj = NULL, feval = NULL, verbose = 1, print.every.n=1L,
+                      early.stop.round = NULL, maximize = NULL, 
+                      save_period = 0, save_name = "xgboost.model", ...) {
   dtrain <- data
   if (typeof(params) != "list") {
     stop("xgb.train: first argument params must be list")
@@ -137,14 +138,33 @@ xgb.train <- function(params=list(), data, nrounds, watchlist = list(),
   }
   if (length(watchlist) != 0 && verbose == 0) {
     warning('watchlist is provided but verbose=0, no evaluation information will be printed')
-    watchlist <- list()
   }
-  params = append(params, list(...))
   
+  dot.params = list(...)
+  nms.params = names(params)
+  nms.dot.params = names(dot.params)
+  if (length(intersect(nms.params,nms.dot.params))>0)
+    stop("Duplicated term in parameters. Please check your list of params.")
+  params = append(params, dot.params)
+  
+  # customized objective and evaluation metric interface
+  if (!is.null(params$objective) && !is.null(obj))
+    stop("xgb.train: cannot assign two different objectives")
+  if (!is.null(params$objective))
+    if (class(params$objective)=='function') {
+      obj = params$objective
+      params$objective = NULL
+    }
+  if (!is.null(params$eval_metric) && !is.null(feval))
+    stop("xgb.train: cannot assign two different evaluation metrics")
+  if (!is.null(params$eval_metric))
+    if (class(params$eval_metric)=='function') {
+      feval = params$eval_metric
+      params$eval_metric = NULL
+    }
+    
   # Early stopping
-  if (is.null(early_stop_round) && !is.null(early.stop.round))
-    early_stop_round = early.stop.round
-  if (!is.null(early_stop_round)){
+  if (!is.null(early.stop.round)){
     if (!is.null(feval) && is.null(maximize))
       stop('Please set maximize to note whether the model is maximizing the evaluation or not.')
     if (length(watchlist) == 0)
@@ -175,14 +195,14 @@ xgb.train <- function(params=list(), data, nrounds, watchlist = list(),
   
   handle <- xgb.Booster(params, append(watchlist, dtrain))
   bst <- xgb.handleToBooster(handle)
-  printEveryN=max( as.integer(printEveryN), 1L)
+  print.every.n=max( as.integer(print.every.n), 1L)
   for (i in 1:nrounds) {
     succ <- xgb.iter.update(bst$handle, dtrain, i - 1, obj)
     if (length(watchlist) != 0) {
       msg <- xgb.iter.eval(bst$handle, watchlist, i - 1, feval)
-      if (0== ( (i-1) %% printEveryN))
+      if (0== ( (i-1) %% print.every.n))
 	    cat(paste(msg, "\n", sep=""))
-      if (!is.null(early_stop_round))
+      if (!is.null(early.stop.round))
       {
         score = strsplit(msg,':|\\s+')[[1]][3]
         score = as.numeric(score)
@@ -190,7 +210,7 @@ xgb.train <- function(params=list(), data, nrounds, watchlist = list(),
           bestScore = score
           bestInd = i
         } else {
-          if (i-bestInd>=early_stop_round) {
+          if (i-bestInd>=early.stop.round) {
             earlyStopflag = TRUE
             cat('Stopping. Best iteration:',bestInd)
             break
@@ -198,9 +218,14 @@ xgb.train <- function(params=list(), data, nrounds, watchlist = list(),
         }
       }
     }
+    if (save_period > 0) {
+      if (i %% save_period == 0) {
+        xgb.save(bst, save_name)
+      }
+    }
   }
   bst <- xgb.Booster.check(bst)
-  if (!is.null(early_stop_round)) {
+  if (!is.null(early.stop.round)) {
     bst$bestScore = bestScore
     bst$bestInd = bestInd
   }

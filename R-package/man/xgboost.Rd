@@ -4,9 +4,10 @@
 \alias{xgboost}
 \title{eXtreme Gradient Boosting (Tree) library}
 \usage{
-xgboost(data = NULL, label = NULL, missing = NULL, params = list(),
-  nrounds, verbose = 1, printEveryN=1L, early_stop_round = NULL, early.stop.round = NULL,
-  maximize = NULL, ...)
+xgboost(data = NULL, label = NULL, missing = NULL, weight = NULL,
+  params = list(), nrounds, verbose = 1, print.every.n = 1L,
+  early.stop.round = NULL, maximize = NULL, save_period = 0,
+  save_name = "xgboost.model", ...)
 }
 \arguments{
 \item{data}{takes \code{matrix}, \code{dgCMatrix}, local data file or
@@ -17,6 +18,8 @@ if data is local data file or  \code{xgb.DMatrix}.}
 
 \item{missing}{Missing is only used when input is dense matrix, pick a float
 value that represents missing value. Sometimes a data use 0 or other extreme value to represents missing values.}
+
+\item{weight}{a vector indicating the weight for each row of the input.}
 
 \item{params}{the list of parameters.
 
@@ -42,16 +45,18 @@ Commonly used ones are:
 information of performance. If 2, xgboost will print information of both
 performance and construction progress information}
 
-\item{printEveryN}{Print every N progress messages when \code{verbose>0}. Default is 1 which means all messages are printed.}
+\item{print.every.n}{Print every N progress messages when \code{verbose>0}. Default is 1 which means all messages are printed.}
 
-\item{early_stop_round}{If \code{NULL}, the early stopping function is not triggered.
+\item{early.stop.round}{If \code{NULL}, the early stopping function is not triggered.
 If set to an integer \code{k}, training with a validation set will stop if the performance
 keeps getting worse consecutively for \code{k} rounds.}
 
-\item{early.stop.round}{An alternative of \code{early_stop_round}.}
-
-\item{maximize}{If \code{feval} and \code{early_stop_round} are set, then \code{maximize} must be set as well.
+\item{maximize}{If \code{feval} and \code{early.stop.round} are set, then \code{maximize} must be set as well.
 \code{maximize=TRUE} means the larger the evaluation score the better.}
+
+\item{save_period}{save the model to the disk in every \code{save_period} rounds, 0 means no such action.}
+
+\item{save_name}{the name or path for periodically saved model file.}
 
 \item{...}{other parameters to pass to \code{params}.}
 }
